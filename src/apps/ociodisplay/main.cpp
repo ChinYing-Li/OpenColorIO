@@ -39,6 +39,7 @@ namespace OCIO = OCIO_NAMESPACE;
 bool g_verbose   = false;
 bool g_gpulegacy = false;
 bool g_gpuinfo   = false;
+bool g_usedp     = false;
 
 std::string g_filename;
 
@@ -64,6 +65,13 @@ int g_channelHot[4]{ 1, 1, 1, 1 };  // show rgb
 
 OCIO::OglAppRcPtr g_oglApp;
 
+// only used when demonstrating the usage of dynamic properties
+OCIO::GpuShaderDescRcPtr dpShaderDesc;
+OCIO::DynamicPropertyRcPtr dpExposure;
+OCIO::DynamicPropertyRcPtr dpContrast;
+OCIO::DynamicPropertyRcPtr dpGamma;
+OCIO::ConstProcessorRcPtr dpProcessor;
+OCIO::ConstGPUProcessorRcPtr dpGpuProcessor;
 
 void UpdateOCIOGLState();
 
@@ -173,6 +181,19 @@ static void InitImageTexture(const char * filename)
 
 }
 
+void InitOCIODp()
+{
+    OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+    OCIO::ExposureContrastTransformRcPtr ec = OCIO::ExposureContrastTransform::Create();
+    ec->setExposure(1.0);
+    ec->makeExposureDynamic();
+    ec->setContrast(0.5);
+    ec->makeContrastDynamic();
+
+    dpProcessor = config->getProcessor(ec);
+    dpGpuProcessor = dpProcessor->getDefaultGPUProcessor();
+}
+
 void InitOCIO(const char * filename)
 {
     OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
@@ -196,6 +217,7 @@ void InitOCIO(const char * filename)
                       << std::endl;
         }
     }
+    if (g_usedp) InitOCIODp();
 }
 
 void Redisplay(void)
@@ -220,7 +242,7 @@ static void CleanUp(void)
 }
 
 
-static void Key(unsigned char key, int /*x*/, int /*y*/)
+static void PipelineKey(unsigned char key, int /*x*/, int /*y*/)
 {
     if(key == 'c' || key == 'C')
     {
@@ -315,7 +337,7 @@ static void SpecialKey(int key, int x, int y)
     glutPostRedisplay();
 }
 
-void UpdateOCIOGLState()
+void UpdateOCIOGLStatePipeline()
 {
     if (!g_oglApp)
     {
@@ -338,6 +360,7 @@ void UpdateOCIOGLState()
     if(g_verbose)
     {
         std::cout << std::endl;
+        std::cout << "Using ViewingPipeline - " << std::endl;
         std::cout << "Color transformation composed of:" << std::endl;
         std::cout << "      Image ColorSpace is:\t" << g_inputColorSpace << std::endl;
         std::cout << "      Transform is:\t\t" << g_transformName << std::endl;
@@ -359,7 +382,6 @@ void UpdateOCIOGLState()
                 std::cout << std::endl << "Optimization: " << opt.first << std::endl;
             }
         }
-
     }
 
     // Add optional transforms to create a full-featured, "canonical" display pipeline
@@ -428,6 +450,74 @@ void UpdateOCIOGLState()
     shaderDesc->setResourcePrefix("ocio_");
     processor->getOptimizedGPUProcessor(g_optimization)->extractGpuShaderInfo(shaderDesc);
     g_oglApp->setShader(shaderDesc);
+}
+
+void UpdateOCIOGLStateDp()
+{
+    if (!g_oglApp || !dpProcessor || !dpGpuProcessor )
+    {
+        return;
+    }
+
+    if(g_verbose)
+    {
+        std::cout << std::endl;
+        std::cout << "Using Dynamic Properties - " << std::endl;
+        std::cout << "Color transformation composed of:" << std::endl;
+        std::cout << "      Image ColorSpace is:\t" << g_inputColorSpace << std::endl;
+        std::cout << "      Transform is:\t\t" << g_transformName << std::endl;
+        std::cout << "      Device is:\t\t" << g_display << std::endl;
+        std::cout << "      Looks Override is:\t'" << g_look << "'" << std::endl;
+        std::cout << "  with:" << std::endl;
+        std::cout << "    exposure_fstop = " << g_exposure_fstop << std::endl;
+        std::cout << "    display_gamma  = " << g_display_gamma << std::endl;
+
+        for (const auto & opt : OptmizationMenu)
+        {
+            if (opt.second == g_optimization)
+            {
+                std::cout << std::endl << "Optimization: " << opt.first << std::endl;
+            }
+        }
+    }
+
+    // Set exposure value.
+    {
+        dpExposure = dpGpuProcessor->getDynamicProperty(OCIO::DYNAMIC_PROPERTY_EXPOSURE);
+        dpExposure->setValue(g_exposure_fstop);
+    }
+
+    // Post-display transform gamma.
+    {
+        dpGamma = dpGpuProcessor->getDynamicProperty(OCIO::DYNAMIC_PROPERTY_GAMMA);
+        dpGamma->setValue(g_display_gamma);
+    }
+
+    // Create GpuShaderDescRcPtr if not yet created.
+    if (dpShaderDesc == nullptr)
+    {
+        if (g_gpulegacy)
+        {
+            dpShaderDesc = OCIO::GpuShaderDesc::CreateLegacyShaderDesc(32);
+        }
+        else
+        {
+            dpShaderDesc = OCIO::GpuShaderDesc::CreateShaderDesc();
+        }
+        dpShaderDesc->setLanguage(OCIO::GPU_LANGUAGE_GLSL_1_3);
+        dpShaderDesc->setFunctionName("OCIODisplay");
+        dpShaderDesc->setResourcePrefix("ocio_");
+    }
+
+    dpGpuProcessor = dpProcessor->getOptimizedGPUProcessor(g_optimization);
+    dpGpuProcessor->extractGpuShaderInfo(dpShaderDesc);
+    g_oglApp->setShader(dpShaderDesc);
+}
+
+void UpdateOCIOGLState()
+{
+    if(g_usedp) UpdateOCIOGLStateDp();
+    else UpdateOCIOGLStatePipeline();
 }
 
 void menuCallback(int /*id*/)
@@ -589,6 +679,7 @@ const char * USAGE_TEXT = "\n"
 "\tAlt+Down:  Gamma down (post display transform)\n"
 "\tAlt+Home:  Reset Exposure + Gamma\n"
 "\n"
+"Channel swizzling disabled if -D specified \n"
 "\tC:   View Color\n"
 "\tR:   View Red\n"
 "\tG:   View Green\n"
@@ -604,6 +695,10 @@ void parseArguments(int argc, char **argv)
 {
     for(int i=1; i<argc; ++i)
     {
+        if(0==strcmp(argv[i], "-D"))
+        {
+            g_usedp = true;
+        }
         if(0==strcmp(argv[i], "-v"))
         {
             g_verbose = true;
@@ -627,6 +722,8 @@ void parseArguments(int argc, char **argv)
             std::cout << "     -v         :  displays the color space information" << std::endl;
             std::cout << "     -gpulegacy :  use the legacy (i.e. baked) GPU color processing" << std::endl;
             std::cout << "     -gpuinfo   :  output the OCIO shader program" << std::endl;
+            std::cout << "     -D         :  use dynamic properties to update gamma and contrast;" << std::endl;
+            std::cout << "                   also disables channel swizzling" << std::endl;
             std::cout << std::endl;
             exit(0);
         }
@@ -660,7 +757,7 @@ int main(int argc, char **argv)
     g_oglApp->setPrintShader(g_gpuinfo);
 
     glutReshapeFunc(Reshape);
-    glutKeyboardFunc(Key);
+    glutKeyboardFunc(PipelineKey);
     glutSpecialFunc(SpecialKey);
     glutDisplayFunc(Redisplay);
 
